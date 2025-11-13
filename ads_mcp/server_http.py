@@ -27,6 +27,16 @@ import uvicorn
 
 from ads_mcp.coordinator import mcp
 
+# Import for better error handling
+try:
+    from google.auth.exceptions import RefreshError, DefaultCredentialsError
+    from google.oauth2.exceptions import RefreshError as OAuth2RefreshError
+except ImportError:
+    # Fallback if imports fail
+    RefreshError = Exception
+    DefaultCredentialsError = Exception
+    OAuth2RefreshError = Exception
+
 # The following imports are necessary to register the tools with the `mcp`
 # object, even though they are not directly used in this file.
 # The `# noqa: F401` comment tells the linter to ignore the "unused import"
@@ -46,6 +56,64 @@ app.add_middleware(
 
 # Store active SSE connections and message queues
 sse_connections: Dict[str, deque] = {}
+
+
+def _check_credentials_available() -> tuple[bool, str]:
+    """Check if credentials and required environment variables are available.
+
+    Returns:
+        tuple: (is_available, error_message)
+    """
+    # Check for required environment variables
+    dev_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
+    if not dev_token:
+        return False, "GOOGLE_ADS_DEVELOPER_TOKEN environment variable is not set"
+
+    # Check for credentials file or ADC
+    creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if creds_file:
+        if not os.path.exists(creds_file):
+            return False, f"Credentials file not found: {creds_file}"
+        # If file exists, credentials should be available
+        return True, ""
+
+    # Check for default credentials location (works for local development)
+    # In Docker containers, credentials might be provided via other means
+    # so we don't fail here, but let the actual API call determine if credentials work
+    try:
+        default_creds_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+        if os.path.exists(default_creds_path):
+            return True, ""
+    except Exception:
+        # If we can't check, assume credentials might be available via other means
+        # (e.g., metadata server in GCP, or environment variables)
+        pass
+
+    # Don't fail pre-check - let the actual API call determine if credentials work
+    # This allows for credentials provided via metadata server or other methods
+    return True, ""
+
+
+def _handle_auth_error(error: Exception) -> str:
+    """Format authentication errors with helpful messages."""
+    error_msg = str(error)
+
+    # Check for specific authentication error patterns
+    if "Reauthentication is needed" in error_msg or isinstance(error, (RefreshError, OAuth2RefreshError)):
+        creds_available, creds_msg = _check_credentials_available()
+        if not creds_available:
+            return f"Authentication failed: {creds_msg}. Original error: {error_msg}"
+        else:
+            return f"Authentication failed: Credentials may have expired. Please refresh your credentials. Original error: {error_msg}"
+
+    if isinstance(error, DefaultCredentialsError) or "Getting metadata from plugin failed" in error_msg:
+        creds_available, creds_msg = _check_credentials_available()
+        if not creds_available:
+            return f"Authentication failed: {creds_msg}. Original error: {error_msg}"
+        else:
+            return f"Authentication failed: Unable to obtain credentials. Please verify your Google Cloud authentication setup. Original error: {error_msg}"
+
+    return error_msg
 
 
 async def process_mcp_request(request_data: dict) -> dict:
@@ -188,7 +256,38 @@ async def process_mcp_request(request_data: dict) -> dict:
                 }
             }
 
+    except (RefreshError, OAuth2RefreshError, DefaultCredentialsError) as e:
+        # Handle authentication errors specifically
+        error_message = _handle_auth_error(e)
+        return {
+            "jsonrpc": "2.0",
+            "id": request_data.get("id"),
+            "error": {
+                "code": -32000,
+                "message": error_message
+            }
+        }
     except Exception as e:
+        # Check if it's an authentication-related error by message content
+        error_msg = str(e)
+        if any(keyword in error_msg for keyword in [
+            "Reauthentication is needed",
+            "Getting metadata from plugin failed",
+            "credentials",
+            "authentication",
+            "auth"
+        ]):
+            error_message = _handle_auth_error(e)
+            return {
+                "jsonrpc": "2.0",
+                "id": request_data.get("id"),
+                "error": {
+                    "code": -32000,
+                    "message": error_message
+                }
+            }
+
+        # Handle other errors
         return {
             "jsonrpc": "2.0",
             "id": request_data.get("id"),
