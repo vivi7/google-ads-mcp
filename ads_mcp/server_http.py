@@ -286,6 +286,22 @@ async def post_sse_message(request: Request):
         }
 
 
+@app.get("/")
+async def root():
+    """Root endpoint - redirects to health check."""
+    return {
+        "status": "healthy",
+        "service": "google-ads-mcp",
+        "transport": "sse/http",
+        "endpoints": {
+            "health": "/health",
+            "sse": "/sse",
+            "message": "/message",
+            "sse_message": "/sse-message"
+        }
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
